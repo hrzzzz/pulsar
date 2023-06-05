@@ -3573,30 +3573,76 @@ public class AdminApiTest extends MockedPulsarServiceBaseTest {
         String namespace = "prop-xyz/ns1";
         //test size check.
         admin.namespaces().setRetention(namespace, new RetentionPolicies(-1, 10));
-        admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitSize(9 * 1024 * 1024).build());
+        admin.namespaces().setBacklogQuota(namespace,
+                BacklogQuota.builder().limitSize(9 * 1024 * 1024).build(), BacklogQuotaType.destination_storage);
         Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
-            admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitSize(100 * 1024 * 1024).build());
+            admin.namespaces().setBacklogQuota(namespace,
+                    BacklogQuota.builder().limitSize(100 * 1024 * 1024).build(), BacklogQuotaType.destination_storage);
         });
 
         //test time check
+        admin.namespaces().removeBacklogQuota(namespace, BacklogQuotaType.destination_storage);
         admin.namespaces().setRetention(namespace, new RetentionPolicies(10, -1));
-        admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitTime(9 * 60).build());
+        admin.namespaces().setBacklogQuota(namespace,
+                BacklogQuota.builder().limitTime(9 * 60).build(), BacklogQuotaType.message_age);
         Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
-            admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitTime(11 * 60).build());
+            admin.namespaces().setBacklogQuota(namespace,
+                    BacklogQuota.builder().limitTime(11 * 60).build(), BacklogQuotaType.message_age);
         });
 
         // test both size and time.
+        admin.namespaces().removeBacklogQuota(namespace, BacklogQuotaType.message_age);
         admin.namespaces().setRetention(namespace, new RetentionPolicies(10, 10));
-        admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitSize(9 * 1024 * 1024).build());
-        admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitTime(9 * 60).build());
-        admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitSize(9 * 1024 * 1024).
-                limitTime(9 * 60).build());
+        admin.namespaces().setBacklogQuota(namespace,
+                BacklogQuota.builder().limitSize(9 * 1024 * 1024).build(), BacklogQuotaType.destination_storage);
+        admin.namespaces().setBacklogQuota(namespace,
+                BacklogQuota.builder().limitTime(9 * 60).build(), BacklogQuotaType.message_age);
         Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
-            admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitSize(100 * 1024 * 1024).build());
+            admin.namespaces().setBacklogQuota(namespace,
+                    BacklogQuota.builder().limitSize(100 * 1024 * 1024).build(), BacklogQuotaType.destination_storage);
         });
         Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
-            admin.namespaces().setBacklogQuota(namespace, BacklogQuota.builder().limitTime(100 * 60).build());
+            admin.namespaces().setBacklogQuota(namespace,
+                    BacklogQuota.builder().limitTime(100 * 60).build(), BacklogQuotaType.message_age);
+        });
+    }
+
+    @Test
+    public void testBacklogQuotaAndRetentionCheck() throws PulsarAdminException {
+        String namespace = "prop-xyz/ns1";
+        //test size check.
+        admin.namespaces().setBacklogQuota(namespace,
+                BacklogQuota.builder().limitSize(10 * 1024 * 1024).build(), BacklogQuotaType.destination_storage);
+        admin.namespaces().setRetention(namespace, new RetentionPolicies(-1, 11));
+        Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
+            admin.namespaces().setRetention(namespace, new RetentionPolicies(-1, 9));
         });
 
+
+        //test time check
+        admin.namespaces().removeBacklogQuota(namespace, BacklogQuotaType.destination_storage);
+        admin.namespaces().setBacklogQuota(namespace,
+                BacklogQuota.builder().limitTime(10 * 60).build(), BacklogQuotaType.message_age);
+        admin.namespaces().setRetention(namespace, new RetentionPolicies(11, -1));
+        Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
+            admin.namespaces().setRetention(namespace, new RetentionPolicies(9, -1));
+        });
+
+        // test both size and time.
+        admin.namespaces().removeBacklogQuota(namespace, BacklogQuotaType.message_age);
+        admin.namespaces().setBacklogQuota(namespace,
+                BacklogQuota.builder().limitSize(10 * 1024 * 1024).build(), BacklogQuotaType.destination_storage);
+        admin.namespaces().setBacklogQuota(namespace,
+                BacklogQuota.builder().limitTime(10 * 60).build(), BacklogQuotaType.message_age);
+        admin.namespaces().setRetention(namespace, new RetentionPolicies(11, 11));
+        Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
+            admin.namespaces().setRetention(namespace, new RetentionPolicies(9, 11));
+        });
+        Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
+            admin.namespaces().setRetention(namespace, new RetentionPolicies(11, 9));
+        });
+        Assert.expectThrows(PulsarAdminException.PreconditionFailedException.class, () -> {
+            admin.namespaces().setRetention(namespace, new RetentionPolicies(9, 9));
+        });
     }
 }

@@ -109,6 +109,7 @@ import org.apache.pulsar.common.policies.data.TopicHashPositions;
 import org.apache.pulsar.common.policies.data.TopicType;
 import org.apache.pulsar.common.policies.data.ValidateResult;
 import org.apache.pulsar.common.policies.data.impl.AutoTopicCreationOverrideImpl;
+import org.apache.pulsar.common.policies.data.impl.BacklogQuotaImpl;
 import org.apache.pulsar.common.policies.data.impl.DispatchRateImpl;
 import org.apache.pulsar.common.util.Codec;
 import org.apache.pulsar.common.util.FutureUtil;
@@ -1332,21 +1333,12 @@ public abstract class NamespacesBase extends AdminResource {
             RetentionPolicies retentionPolicies = policies.retention_policies;
             final BacklogQuotaType quotaType = backlogQuotaType != null ? backlogQuotaType
                     : BacklogQuotaType.destination_storage;
-            if (retentionPolicies == null) {
-                policies.backlog_quota_map.put(quotaType, quota);
-                return policies;
-            }
-            // If we have retention policies, we have to check the conflict.
-            BacklogQuota needCheckQuota = null;
-            if (quotaType == BacklogQuotaType.destination_storage) {
-                needCheckQuota = quota;
-            }
-            boolean passCheck = checkBacklogQuota(needCheckQuota, retentionPolicies);
-            if (!passCheck) {
+            if (!checkBacklogQuota(quota, retentionPolicies)) {
                 throw new RestException(Response.Status.PRECONDITION_FAILED,
                         "Backlog Quota exceeds configured retention quota for namespace."
                                 + " Please increase retention quota and retry");
             }
+            policies.backlog_quota_map.put(quotaType, quota);
             return policies;
         });
     }
@@ -1778,7 +1770,20 @@ public abstract class NamespacesBase extends AdminResource {
         if (backlogQuotaMap.isEmpty()) {
             return true;
         }
-        BacklogQuota quota = backlogQuotaMap.get(BacklogQuotaType.destination_storage);
+        // merge destination_storage and message_age
+        BacklogQuota destinationStorage = backlogQuotaMap.get(BacklogQuotaType.destination_storage);
+        BacklogQuota messageAge = backlogQuotaMap.get(BacklogQuotaType.message_age);
+        BacklogQuota quota = null;
+        if (destinationStorage != null || messageAge != null) {
+            BacklogQuotaImpl.BacklogQuotaImplBuilder builder = BacklogQuotaImpl.builder();
+            if (destinationStorage != null) {
+                builder.limitSize(destinationStorage.getLimitSize());
+            }
+            if (messageAge != null) {
+                builder.limitTime(messageAge.getLimitTime());
+            }
+            quota = builder.build();
+        }
         return checkBacklogQuota(quota, retention);
     }
 
