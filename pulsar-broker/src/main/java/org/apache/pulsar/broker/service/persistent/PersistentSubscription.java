@@ -361,11 +361,14 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
 
     @Override
     public void acknowledgeMessage(List<Position> positions, AckType ackType, Map<String, Long> properties) {
+        // 更新cursor活跃时间
         cursor.updateLastActive();
+        // 记录cursor当前的markDeletePosition
         Position previousMarkDeletePosition = cursor.getMarkDeletedPosition();
 
-        if (ackType == AckType.Cumulative) {
+        if (ackType == AckType.Cumulative) { // 累计确认的情况
 
+            // 累计确认只需要提供一个position
             if (positions.size() != 1) {
                 log.warn("[{}][{}] Invalid cumulative ack received with multiple message ids.", topicName, subName);
                 return;
@@ -375,28 +378,34 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
             if (log.isDebugEnabled()) {
                 log.debug("[{}][{}] Cumulative ack on {}", topicName, subName, position);
             }
+            // 直接标记删除
             cursor.asyncMarkDelete(position, mergeCursorProperties(properties),
                     markDeleteCallback, previousMarkDeletePosition);
 
-        } else {
+        } else { // 单独确认的情况
             if (log.isDebugEnabled()) {
                 log.debug("[{}][{}] Individual acks on {}", topicName, subName, positions);
             }
+            // 单独删除
             cursor.asyncDelete(positions, deleteCallback, previousMarkDeletePosition);
             if (topic.getBrokerService().getPulsar().getConfig().isTransactionCoordinatorEnabled()) {
                 positions.forEach(position -> {
                     if (((ManagedCursorImpl) cursor).isMessageDeleted(position)) {
+                        // 开启事务的情况，需要把pendingAckHandle中单独确认的消息移除
                         pendingAckHandle.clearIndividualPosition(position);
                     }
                 });
             }
 
+            // 清除dispatcher的redelivery中已经删除的消息
             if (dispatcher != null) {
                 dispatcher.getRedeliveryTracker().removeBatch(positions);
             }
         }
 
+        // 如果现在cursor的markDeletePosition和之前记录的不一样，那么说明markDeletePosition移动了
         if (!cursor.getMarkDeletedPosition().equals(previousMarkDeletePosition)) {
+            // 更新markDeletePosition移动的时间
             this.updateLastMarkDeleteAdvancedTimestamp();
 
             // Mark delete position advance
@@ -414,6 +423,7 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
         if (topic.getManagedLedger().isTerminated() && cursor.getNumberOfEntriesInBacklog(false) == 0) {
             // Notify all consumer that the end of topic was reached
             if (dispatcher != null) {
+                // 如果到达topic的末尾，检测是否要执行到达末尾时的动作
                 checkAndApplyReachedEndOfTopicOrTopicMigration(topic, dispatcher.getConsumers());
             }
         }
@@ -627,6 +637,7 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
                     cursor.getNumberOfEntriesInBacklog(false));
         }
 
+        // 调用cursor的clearBacklog方法
         cursor.asyncClearBacklog(new ClearBacklogCallback() {
             @Override
             public void clearBacklogComplete(Object ctx) {
@@ -665,6 +676,7 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
             log.debug("[{}][{}] Skipping {} messages, current backlog {}", topicName, subName, numMessagesToSkip,
                     cursor.getNumberOfEntriesInBacklog(false));
         }
+        // 调用cursor的skip方法
         cursor.asyncSkipEntries(numMessagesToSkip, IndividualDeletedEntries.Exclude,
                 new AsyncCallbacks.SkipEntriesCallback() {
                     @Override
@@ -745,6 +757,7 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
     }
 
     private void resetCursor(Position finalPosition, CompletableFuture<Void> future) {
+        // 在resetCursor前，先把订阅设置为fenced状态
         if (!IS_FENCED_UPDATER.compareAndSet(PersistentSubscription.this, FALSE, TRUE)) {
             future.completeExceptionally(new SubscriptionBusyException("Failed to fence subscription"));
             return;
@@ -753,6 +766,7 @@ public class PersistentSubscription extends AbstractSubscription implements Subs
         final CompletableFuture<Void> disconnectFuture;
 
         // Lock the Subscription object before locking the Dispatcher object to avoid deadlocks
+        // 先把连接上来的所有consumer断开
         synchronized (this) {
             if (dispatcher != null && dispatcher.isConsumerConnected()) {
                 disconnectFuture = dispatcher.disconnectActiveConsumers(true);

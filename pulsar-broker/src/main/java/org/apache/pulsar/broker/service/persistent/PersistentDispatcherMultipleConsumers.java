@@ -159,15 +159,19 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             consumer.disconnect();
             return CompletableFuture.completedFuture(null);
         }
+        // 如果发现consumerList为空，说明之前的consumer已经全部断开，我们要重置一遍dispatcher的状态
         if (consumerList.isEmpty()) {
             if (havePendingRead || havePendingReplayRead) {
-                // There is a pending read from previous run. We must wait for it to complete and then rewind
+                // 如果有之前的读操作在进行，我们要等待这些读操作结束后，再进行rewind，因此这里先设置一个标志位
                 shouldRewindBeforeReadingOrReplaying = true;
             } else {
+                // 把cursor的位置调整到markDelete位置
                 cursor.rewind();
                 shouldRewindBeforeReadingOrReplaying = false;
             }
+            // 清除需要重新投递的消息列表
             redeliveryMessages.clear();
+            // 清除延迟投递的消息列表
             delayedDeliveryTracker.ifPresent(tracker -> {
                 // Don't clean up BucketDelayedDeliveryTracker, otherwise we will lose the bucket snapshot
                 if (tracker instanceof InMemoryDelayedDeliveryTracker) {
@@ -176,16 +180,20 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             });
         }
 
+        // 判断是否超过consumer上限，若超过则无法添加新的consumer
         if (isConsumersExceededOnSubscription()) {
             log.warn("[{}] Attempting to add consumer to subscription which reached max consumers limit", name);
             return FutureUtil.failedFuture(new ConsumerBusyException("Subscription reached max consumers limit"));
         }
 
+        // 添加consumer到consumerList中
         consumerList.add(consumer);
+        // 在consumerList中根据consumer的优先级排序consumer
         if (consumerList.size() > 1
                 && consumer.getPriorityLevel() < consumerList.get(consumerList.size() - 2).getPriorityLevel()) {
             consumerList.sort(Comparator.comparingInt(Consumer::getPriorityLevel));
         }
+        // 添加consumer到consumerSet中
         consumerSet.add(consumer);
 
         return CompletableFuture.completedFuture(null);
@@ -199,33 +207,43 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
     @Override
     public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
         // decrement unack-message count for removed consumer
+        // 将要移除的consumer的未ack消息数量从未ack消息总数中减去
         addUnAckedMessages(-consumer.getUnackedMessages());
+        // consumer存在consumerSet中并被移除
         if (consumerSet.removeAll(consumer) == 1) {
+            // 从consumerList中移除consumer
             consumerList.remove(consumer);
             log.info("Removed consumer {} with pending {} acks", consumer, consumer.getPendingAcks().size());
-            if (consumerList.isEmpty()) {
+            if (consumerList.isEmpty()) { // 当前consumer移除后，dispatcher中没有consumer的情况
+                // 取消进行中的读操作
                 cancelPendingRead();
 
+                // 清除redelivery消息
                 redeliveryMessages.clear();
                 redeliveryTracker.clear();
+                // 如果有关闭前需要执行的操作，那么执行一下
                 if (closeFuture != null) {
                     log.info("[{}] All consumers removed. Subscription is disconnected", name);
                     closeFuture.complete(null);
                 }
+                // 重置availablePermits为0
                 totalAvailablePermits = 0;
-            } else {
+            } else { // 移除consumer后，dispatcher中还有consumer的情况
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Consumer are left, reading more entries", name);
                 }
+                // 当前要移除的consumer中没有ack的消息都要重新replay
                 consumer.getPendingAcks().forEach((ledgerId, entryId, batchSize, stickyKeyHash) -> {
                     addMessageToReplay(ledgerId, entryId, stickyKeyHash);
                 });
+                // dispatcher的availablePermits要减去要移除的这个consumer的availablePermits
                 totalAvailablePermits -= consumer.getAvailablePermits();
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Decreased totalAvailablePermits by {} in PersistentDispatcherMultipleConsumers. "
                                     + "New dispatcher permit count is {}", name, consumer.getAvailablePermits(),
                             totalAvailablePermits);
                 }
+                // 主动触发读操作，因为这里可能有需要replay给consumer的消息
                 readMoreEntries();
             }
         } else {
@@ -241,6 +259,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
     }
 
     private synchronized void internalConsumerFlow(Consumer consumer, int additionalNumberOfMessages) {
+        // 如果consumer不存在，则直接返回
         if (!consumerSet.contains(consumer)) {
             if (log.isDebugEnabled()) {
                 log.debug("[{}] Ignoring flow control from disconnected consumer {}", name, consumer);
@@ -248,6 +267,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             return;
         }
 
+        // consumer请求可以接收这么多的消息数，这个数量要加到dispatcher的permits上
         totalAvailablePermits += additionalNumberOfMessages;
 
         if (log.isDebugEnabled()) {
@@ -255,6 +275,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
                             + "after adding {} permits", name, consumer,
                     totalAvailablePermits, additionalNumberOfMessages);
         }
+        // 触发读操作
         readMoreEntries();
     }
 
@@ -267,63 +288,79 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
     }
 
     public synchronized void readMoreEntries() {
+        // 如果之前的发送操作正在进行中，我们不应该读新的entries，否则可能读取到相同的entries，导致重复发送
         if (isSendInProgress()) {
             // we cannot read more entries while sending the previous batch
             // otherwise we could re-read the same entries and send duplicates
             return;
         }
+        // 是否需要因为延迟投递暂停发送
         if (shouldPauseDeliveryForDelayTracker()) {
             return;
         }
 
         // totalAvailablePermits may be updated by other threads
+        // 找到第一个有permits的consumer的permits数
         int firstAvailableConsumerPermits = getFirstAvailableConsumerPermits();
+        // 因为其它线程可能修改totalAvailablePermits，因此这里取firstAvailableConsumerPermits和totalAvailablePermits的最大值
+        // 作为当前可用的permits
         int currentTotalAvailablePermits = Math.max(totalAvailablePermits, firstAvailableConsumerPermits);
         if (currentTotalAvailablePermits > 0 && firstAvailableConsumerPermits > 0) {
+            // 计算最终当前可以读取的消息条数以及消息大小
             Pair<Integer, Long> calculateResult = calculateToRead(currentTotalAvailablePermits);
             int messagesToRead = calculateResult.getLeft();
             long bytesToRead = calculateResult.getRight();
 
+            // 可能因为限速，或者之前读操作没有完成的原因，现在不能进行读取操作，那么直接返回
             if (messagesToRead == -1 || bytesToRead == -1) {
                 // Skip read as topic/dispatcher has exceed the dispatch rate or previous pending read hasn't complete.
                 return;
             }
 
+            // 获取需要重新投递的消息
             NavigableSet<PositionImpl> messagesToReplayNow = getMessagesToReplayNow(messagesToRead);
 
-            if (!messagesToReplayNow.isEmpty()) {
+            if (!messagesToReplayNow.isEmpty()) { // 需要重新投递的消息不为空，那么优先投递这部分消息
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Schedule replay of {} messages for {} consumers", name, messagesToReplayNow.size(),
                             consumerList.size());
                 }
 
+                // 表示有正在进行中的replay操作
                 havePendingReplayRead = true;
+                // 获取当前需要replay的消息中最旧消息的Position
                 minReplayedPosition = messagesToReplayNow.first();
+                // 读取需要replay的消息并发送给consumer，这里返回值是在replay之前发现已经删除的消息
                 Set<? extends Position> deletedMessages = topic.isDelayedDeliveryEnabled()
                         ? asyncReplayEntriesInOrder(messagesToReplayNow) : asyncReplayEntries(messagesToReplayNow);
-                // clear already acked positions from replay bucket
 
+                // 对于已经删除的消息，要从redeliveryMessages中移除
                 deletedMessages.forEach(position -> redeliveryMessages.remove(((PositionImpl) position).getLedgerId(),
                         ((PositionImpl) position).getEntryId()));
                 // if all the entries are acked-entries and cleared up from redeliveryMessages, try to read
                 // next entries as readCompletedEntries-callback was never called
+                // 如果需要replay的消息在replay之前就已经全部被确认了，那么这里要主动触发readMoreEntries操作
                 if ((messagesToReplayNow.size() - deletedMessages.size()) == 0) {
                     havePendingReplayRead = false;
                     readMoreEntriesAsync();
                 }
             } else if (BLOCKED_DISPATCHER_ON_UNACKMSG_UPDATER.get(this) == TRUE) {
+                // unack的消息数量超过上限时，这里不会读取新的消息
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Dispatcher read is blocked due to unackMessages {} reached to max {}", name,
                             totalUnackedMessages, topic.getMaxUnackedMessagesOnSubscription());
                 }
-            } else if (!havePendingRead) {
+            } else if (!havePendingRead) { // 没有需要replay的消息，没有因为unack消息卡住，没有正在进行中的读操作
                 if (log.isDebugEnabled()) {
                     log.debug("[{}] Schedule read of {} messages for {} consumers", name, messagesToRead,
                             consumerList.size());
                 }
+                // 设置有正在进行中的读操作
                 havePendingRead = true;
+                // 获取第一条需要replay的消息，也就是最旧的那一条
                 NavigableSet<PositionImpl> toReplay = getMessagesToReplayNow(1);
                 if (!toReplay.isEmpty()) {
+                    // 记录这时候需要replay的最小的Position，因为我们不会发送这条消息，因此把他加回redeliveryMessages
                     minReplayedPosition = toReplay.first();
                     redeliveryMessages.add(minReplayedPosition.getLedgerId(), minReplayedPosition.getEntryId());
                 } else {
@@ -331,6 +368,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
                 }
 
                 // Filter out and skip read delayed messages exist in DelayedDeliveryTracker
+                // 如果有延迟发送消息的情况，过滤出已经存在于DelayedDeliveryTracker中的消息，发送剩余的消息
                 if (delayedDeliveryTracker.isPresent()) {
                     Predicate<PositionImpl> skipCondition = null;
                     final DelayedDeliveryTracker deliveryTracker = delayedDeliveryTracker.get();
@@ -341,6 +379,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
                     cursor.asyncReadEntriesWithSkipOrWait(messagesToRead, bytesToRead, this, ReadType.Normal,
                             topic.getMaxReadPosition(), skipCondition);
                 } else {
+                    // 调用cursor去读取消息
                     cursor.asyncReadEntriesOrWait(messagesToRead, bytesToRead, this, ReadType.Normal,
                             topic.getMaxReadPosition());
                 }
@@ -371,11 +410,15 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
 
     // left pair is messagesToRead, right pair is bytesToRead
     protected Pair<Integer, Long> calculateToRead(int currentTotalAvailablePermits) {
+        // 可以读取的消息数是当前可用的permits以及最大批量读取消息数量的最小值
         int messagesToRead = Math.min(currentTotalAvailablePermits, readBatchSize);
+        // 一次读取最大可读取的消息大小
         long bytesToRead = serviceConfig.getDispatcherMaxReadSizeBytes();
 
+        // 随机获取一个consumer
         Consumer c = getRandomConsumer();
         // if turn on precise dispatcher flow control, adjust the record to read
+        // 如果开启精确的分发，则计算出精确的可以读取的消息数
         if (c != null && c.isPreciseDispatcherFlowControl()) {
             int avgMessagesPerEntry = Math.max(1, c.getAvgMessagesPerEntry());
             messagesToRead = Math.min(
@@ -383,6 +426,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
                     readBatchSize);
         }
 
+        // 如果当前consumer不能写，那么把可读消息设置为1，这样可以应用原来代码的通知机制
         if (!isConsumerWritable()) {
             // If the connection is not currently writable, we issue the read request anyway, but for a single
             // message. The intent here is to keep use the request as a notification mechanism while avoiding to
@@ -394,6 +438,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
         // throttle only if: (1) cursor is not active (or flag for throttle-nonBacklogConsumer is enabled) bcz
         // active-cursor reads message from cache rather from bookkeeper (2) if topic has reached message-rate
         // threshold: then schedule the read after MESSAGE_RATE_BACKOFF_MS
+        // 限速过滤
         if (serviceConfig.isDispatchThrottlingOnNonBacklogConsumerEnabled() || !cursor.isActive()) {
             if (topic.getBrokerDispatchRateLimiter().isPresent()) {
                 DispatchRateLimiter brokerRateLimiter = topic.getBrokerDispatchRateLimiter().get();
@@ -447,6 +492,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             }
         }
 
+        // 有正在replay的操作，那返回-1，-1
         if (havePendingReplayRead) {
             if (log.isDebugEnabled()) {
                 log.debug("[{}] Skipping replay while awaiting previous read to complete", name);
@@ -542,13 +588,16 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
 
     @Override
     public final synchronized void readEntriesComplete(List<Entry> entries, Object ctx) {
+        // readEntries成功的回调
         ReadType readType = (ReadType) ctx;
+        // 更新状态
         if (readType == ReadType.Normal) {
             havePendingRead = false;
         } else {
             havePendingReplayRead = false;
         }
 
+        // 更新readBatchSize
         if (readBatchSize < serviceConfig.getDispatcherMaxReadBatchSize()) {
             int newReadBatchSize = Math.min(readBatchSize * 2, serviceConfig.getDispatcherMaxReadBatchSize());
             if (log.isDebugEnabled()) {
@@ -560,6 +609,8 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
 
         readFailureBackoff.reduceToHalf();
 
+        // 如果是读取新消息并且shouldRewindBeforeReadingOrReplaying，那么这批消息要释放，不能发给consumer
+        // 因为所有consumer已经断开连接了，在这个读操作完成之前
         if (shouldRewindBeforeReadingOrReplaying && readType == ReadType.Normal) {
             // All consumers got disconnected before the completion of the read operation
             entries.forEach(Entry::release);
@@ -573,6 +624,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             log.debug("[{}] Distributing {} messages to {} consumers", name, entries.size(), consumerList.size());
         }
 
+        // 更新等待dispatch的消息大小
         long size = entries.stream().mapToLong(Entry::getLength).sum();
         updatePendingBytesToDispatch(size);
 
@@ -582,10 +634,14 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
         if (serviceConfig.isDispatcherDispatchMessagesInSubscriptionThread()) {
             // setting sendInProgress here, because sendMessagesToConsumers will be executed
             // in a separate thread, and we want to prevent more reads
+            // 因为发送操作在另外一个线程执行，因此这里设置标志位为true，避免在发送完成前进行新的readEntries操作
             acquireSendInProgress();
             dispatchMessagesThread.execute(() -> {
+                // 发送消息给consumer
                 if (sendMessagesToConsumers(readType, entries, false)) {
+                    // 更新等待dispatch的消息大小
                     updatePendingBytesToDispatch(-size);
+                    // readMoreEntries
                     readMoreEntries();
                 } else {
                     updatePendingBytesToDispatch(-size);
@@ -632,12 +688,14 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
      * if you need to change it.
      */
     protected synchronized boolean trySendMessagesToConsumers(ReadType readType, List<Entry> entries) {
+        // 过滤已经删除的消息
         if (needTrimAckedMessages()) {
             cursor.trimDeletedEntries(entries);
         }
 
         int entriesToDispatch = entries.size();
         // Trigger read more messages
+        // 没有要dispatch的消息，直接返回
         if (entriesToDispatch == 0) {
             return true;
         }
@@ -655,6 +713,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             }
             metadataArray[i] = metadata;
         }
+        // 如果有chunk消息的情况，则调用另外方法发送
         if (hasChunk) {
             return sendChunkedMessagesToConsumers(readType, entries, metadataArray);
         }
@@ -663,17 +722,22 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
         long totalMessagesSent = 0;
         long totalBytesSent = 0;
         long totalEntries = 0;
+        // 平均每个batch的消息数量
         int avgBatchSizePerMsg = remainingMessages > 0 ? Math.max(remainingMessages / entries.size(), 1) : 1;
 
         int firstAvailableConsumerPermits, currentTotalAvailablePermits;
         boolean dispatchMessage;
-        while (entriesToDispatch > 0) {
+        while (entriesToDispatch > 0) { // 循环发送
+            // 第一个有permits的consumer的permits
             firstAvailableConsumerPermits = getFirstAvailableConsumerPermits();
+            // 当前可用的permits
             currentTotalAvailablePermits = Math.max(totalAvailablePermits, firstAvailableConsumerPermits);
+            // 判断是否可以发送
             dispatchMessage = currentTotalAvailablePermits > 0 && firstAvailableConsumerPermits > 0;
             if (!dispatchMessage) {
                 break;
             }
+            // 获取消费者
             Consumer c = getNextConsumer();
             if (c == null) {
                 // Do nothing, cursor will be rewind at reconnection
@@ -684,6 +748,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             }
 
             // round-robin dispatch batch size for this consumer
+            // 获取consumer的availablePermits
             int availablePermits = c.isWritable() ? c.getAvailablePermits() : 1;
             if (c.getMaxUnackedMessages() > 0) {
                 // Avoid negative number
@@ -696,6 +761,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
                         c, c.getAvailablePermits());
             }
 
+            // 计算可以发送给consumer的消息数
             int messagesForC = Math.min(Math.min(remainingMessages, availablePermits),
                     serviceConfig.getDispatcherMaxRoundRobinBatchSize());
             messagesForC = Math.max(messagesForC / avgBatchSizePerMsg, 1);
@@ -704,6 +770,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             List<Entry> entriesForThisConsumer = entries.subList(start, end);
 
             // remove positions first from replay list first : sendMessages recycles entries
+            // 如果是replay，那么先从redeliveryMessages中移除药发送的消息
             if (readType == ReadType.Replay) {
                 entriesForThisConsumer.forEach(entry -> {
                     redeliveryMessages.remove(entry.getLedgerId(), entry.getEntryId());
@@ -736,8 +803,10 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             totalBytesSent += sendMessageInfo.getTotalBytes();
         }
 
+        // 请求permits
         acquirePermitsForDeliveredMessages(topic, cursor, totalEntries, totalMessagesSent, totalBytesSent);
 
+        // 跳出上面循环后，如果发现这批entries没有全部发送，那么剩余的entries要添加到redeliveryMessages中
         if (entriesToDispatch > 0) {
             if (log.isDebugEnabled()) {
                 log.debug("[{}] No consumers found with available permits, storing {} positions for later replay", name,
@@ -931,6 +1000,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
 
     @Override
     public synchronized void redeliverUnacknowledgedMessages(Consumer consumer, long consumerEpoch) {
+        // 主动请求把已经发送出去但是没有ack的消息重新投递，这里会放到redeliveryMessages中，然后调用readMoreEntries读取消息
         consumer.getPendingAcks().forEach((ledgerId, entryId, batchSize, stickyKeyHash) -> {
             if (addMessageToReplay(ledgerId, entryId, stickyKeyHash)) {
                 redeliveryTracker.incrementAndGetRedeliveryCount((PositionImpl.get(ledgerId, entryId)));
@@ -1070,6 +1140,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
     }
 
     protected synchronized NavigableSet<PositionImpl> getMessagesToReplayNow(int maxMessagesToRead) {
+        // 找出延迟发送消息中可发送的消息，添加到redeliveryMessages中
         if (delayedDeliveryTracker.isPresent() && delayedDeliveryTracker.get().hasMessageAvailable()) {
             delayedDeliveryTracker.get().resetTickTime(topic.getDelayedDeliveryTickTimeMillis());
             NavigableSet<PositionImpl> messagesAvailableNow =
@@ -1077,6 +1148,7 @@ public class PersistentDispatcherMultipleConsumers extends AbstractDispatcherMul
             messagesAvailableNow.forEach(p -> redeliveryMessages.add(p.getLedgerId(), p.getEntryId()));
         }
 
+        // 从redeliveryMessages中拿出给定条数的消息
         if (!redeliveryMessages.isEmpty()) {
             return redeliveryMessages.getMessagesToReplayNow(maxMessagesToRead);
         } else {

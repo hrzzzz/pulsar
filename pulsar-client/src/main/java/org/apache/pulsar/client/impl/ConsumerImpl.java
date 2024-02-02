@@ -453,10 +453,13 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     protected Message<T> internalReceive() throws PulsarClientException {
         Message<T> message;
         try {
+            // receive队列中没有消息时，增加更多可以接收的消息（消费很快，可以一次性多拉一些消息）
             if (incomingMessages.isEmpty()) {
                 expectMoreIncomingMessages();
             }
+            // 阻塞直到拿到消息
             message = incomingMessages.take();
+            // 进行消息的处理动作，比如增加Permits，追踪消息等
             messageProcessed(message);
             return beforeConsume(message);
         } catch (InterruptedException e) {
@@ -487,11 +490,14 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
 
     @Override
     protected Message<T> internalReceive(long timeout, TimeUnit unit) throws PulsarClientException {
+        // 带超时时间的receive方法
         Message<T> message;
         try {
+            //
             if (incomingMessages.isEmpty()) {
                 expectMoreIncomingMessages();
             }
+            // 在指定时间内取出一条消息，若超时则返回null
             message = incomingMessages.poll(timeout, unit);
             if (message == null) {
                 return null;
@@ -548,6 +554,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     protected CompletableFuture<Void> doAcknowledge(MessageId messageId, AckType ackType,
                                                     Map<String, Long> properties,
                                                     TransactionImpl txn) {
+        // 状态不对的情况
         if (getState() != State.Ready && getState() != State.Connecting) {
             stats.incrementNumAcksFailed();
             PulsarClientException exception = new PulsarClientException("Consumer not ready. State: " + getState());
@@ -559,6 +566,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
             return FutureUtil.failedFuture(exception);
         }
 
+        // 事务ack的情况
         if (txn != null) {
             return doTransactionAcknowledgeForResponse(messageId, ackType, null, properties,
                     new TxnID(txn.getTxnIdMostBits(), txn.getTxnIdLeastBits()));
@@ -997,6 +1005,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
                             }
                         });
             } else {
+                // 给broker发送请求，让broker发送消息
                 cnx.ctx().writeAndFlush(Commands.newFlow(consumerId, numMessages), cnx.ctx().voidPromise());
             }
         }
@@ -1708,16 +1717,22 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
      */
     @Override
     protected synchronized void messageProcessed(Message<?> msg) {
+        // 当前cnx
         ClientCnx currentCnx = cnx();
+        // 消息从哪个cnx发送来的
         ClientCnx msgCnx = ((MessageImpl<?>) msg).getCnx();
+        // 更新最新出队的消息id
         lastDequeuedMessageId = msg.getMessageId();
 
         if (msgCnx != currentCnx) {
+            // 如果当前cnx和消息的cnx不同，因此要丢弃这条消息
             // The processed message did belong to the old queue that was cleared after reconnection.
         } else {
             if (listener == null && !parentConsumerHasListener) {
+                // 把availablePermits加1
                 increaseAvailablePermits(currentCnx);
             }
+            // 更新状态
             stats.updateNumMsgsReceived(msg);
 
             trackMessage(msg);
@@ -1736,6 +1751,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     }
 
     protected void trackMessage(MessageId messageId, int redeliveryCount) {
+        // 有ack超时时间
         if (conf.getAckTimeoutMillis() > 0 && messageId instanceof MessageIdImpl) {
             MessageId id = MessageIdAdvUtils.discardBatch(messageId);
             if (hasParentConsumer) {
@@ -1743,6 +1759,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
                 // we should no longer track this message, TopicsConsumer will take care from now onwards
                 unAckedMessageTracker.remove(id);
             } else {
+                // 跟踪状态消息
                 trackUnAckedMsgIfNoListener(id, redeliveryCount);
             }
         }
@@ -1761,9 +1778,13 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     }
 
     protected void increaseAvailablePermits(ClientCnx currentCnx, int delta) {
+        // 更新availablePermits
         int available = AVAILABLE_PERMITS_UPDATER.addAndGet(this, delta);
+        // 当发现availablePermits大于等于receiverQueueSize的一半，并且没有paused
         while (available >= getCurrentReceiverQueueSize() / 2 && !paused) {
+            // 把available清0
             if (AVAILABLE_PERMITS_UPDATER.compareAndSet(this, available, 0)) {
+                // 请求broker发送消息
                 sendFlowPermitsToBroker(currentCnx, available);
                 break;
             } else {
@@ -1779,12 +1800,14 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     @Override
     protected void setCurrentReceiverQueueSize(int newSize) {
         checkArgument(newSize > 0, "receiver queue size should larger than 0");
+        // 更新receiverQueueSize的大小
         int oldSize = CURRENT_RECEIVER_QUEUE_SIZE_UPDATER.getAndSet(this, newSize);
         int delta = newSize - oldSize;
         if (log.isDebugEnabled()) {
             log.debug("[{}][{}] update currentReceiverQueueSize from {} to {}, increaseAvailablePermits by {}",
                     topic, subscription, oldSize, newSize, delta);
         }
+        // 增加availablePermits
         increaseAvailablePermits(delta);
     }
 
@@ -2807,23 +2830,26 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         final long ledgerId = messageIdAdv.getLedgerId();
         final long entryId = messageIdAdv.getEntryId();
         final List<ByteBuf> cmdList;
-        if (MessageIdAdvUtils.isBatch(messageIdAdv)) {
+        if (MessageIdAdvUtils.isBatch(messageIdAdv)) { // batch消息的情况
             BitSetRecyclable bitSetRecyclable = BitSetRecyclable.create();
             bitSetRecyclable.set(0, messageIdAdv.getBatchSize());
-            if (ackType == AckType.Cumulative) {
+            if (ackType == AckType.Cumulative) { // 累计确认的情况
+                // 处理messageIdAdv的ackSet，把batchIndex及之前的都设置为0
                 MessageIdAdvUtils.acknowledge(messageIdAdv, false);
+                // 把batchIndex及之前的都设置为0
                 bitSetRecyclable.clear(0, messageIdAdv.getBatchIndex() + 1);
-            } else {
+            } else {  // 单独确认的情况
                 bitSetRecyclable.clear(messageIdAdv.getBatchIndex());
             }
+            // 构建cmd
             cmdList = Collections.singletonList(Commands.newAck(consumerId, ledgerId, entryId, bitSetRecyclable,
                     ackType, validationError, properties, txnID.getLeastSigBits(), txnID.getMostSigBits(), requestId,
                     messageIdAdv.getBatchSize()));
             bitSetRecyclable.recycle();
-        } else {
+        } else { // 非batch消息的情况
             MessageIdImpl[] chunkMsgIds = this.unAckedChunkedMessageIdSequenceMap.remove(messageIdAdv);
             // cumulative ack chunk by the last messageId
-            if (chunkMsgIds == null || ackType == AckType.Cumulative) {
+            if (chunkMsgIds == null || ackType == AckType.Cumulative) { // 不是chunk消息或者是累计确认的情况
                 cmdList = Collections.singletonList(Commands.newAck(consumerId, ledgerId, entryId, null, ackType,
                         validationError, properties, txnID.getLeastSigBits(), txnID.getMostSigBits(), requestId));
             } else {
@@ -2849,6 +2875,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
             }
         }
 
+        // 取消追踪已经确认的消息
         if (ackType == AckType.Cumulative) {
             unAckedMessageTracker.removeMessagesTill(messageId);
         } else {
@@ -2860,6 +2887,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
                     .ConnectException("Failed to ack message [" + messageId + "] "
                     + "for transaction [" + txnID + "] due to consumer connect fail, consumer state: " + getState()));
         } else {
+            // 请求broker ack消息
             List<CompletableFuture<Void>> completableFutures = new LinkedList<>();
             cmdList.forEach(cmd -> completableFutures.add(cnx.newAckForReceipt(cmd, requestId)));
             return FutureUtil.waitForAll(completableFutures);

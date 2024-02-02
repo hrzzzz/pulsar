@@ -217,6 +217,7 @@ public class PulsarClientImpl implements PulsarClient {
             }
 
             if (conf.isEnableTransaction()) {
+                // 创建client时，若发现开启事务，则需要创建TC的client
                 tcClient = new TransactionCoordinatorClientImpl(this);
                 try {
                     tcClient.start();
@@ -226,6 +227,7 @@ public class PulsarClientImpl implements PulsarClient {
                 }
             }
 
+            // 内存控制器，默认允许内存大小是60MB，在到达95%的时候会将consumer的receiverQueueSize缩小
             memoryLimitController = new MemoryLimitController(conf.getMemoryLimitBytes(),
                     (long) (conf.getMemoryLimitBytes() * THRESHOLD_FOR_CONSUMER_RECEIVER_QUEUE_SIZE_SHRINKING),
                     this::reduceConsumerReceiverQueueSize);
@@ -266,6 +268,7 @@ public class PulsarClientImpl implements PulsarClient {
         ProducerBuilderImpl<T> producerBuilder = new ProducerBuilderImpl<>(this, schema);
         if (!memoryLimitController.isMemoryLimited()) {
             // set default limits for producers when memory limit controller is disabled
+            // 如果内存限制器没有开的情况，要设置producer默认pending messages是1000，多个分区是50000
             producerBuilder.maxPendingMessages(NO_MEMORY_LIMIT_DEFAULT_MAX_PENDING_MESSAGES);
             producerBuilder.maxPendingMessagesAcrossPartitions(
                     NO_MEMORY_LIMIT_DEFAULT_MAX_PENDING_MESSAGES_ACROSS_PARTITIONS);
@@ -525,7 +528,7 @@ public class PulsarClientImpl implements PulsarClient {
             }
 
             ConsumerBase<T> consumer;
-            if (metadata.partitions > 0) {
+            if (metadata.partitions > 0) { // 分区数大于0的情况
                 consumer = MultiTopicsConsumerImpl.createPartitionedConsumer(PulsarClientImpl.this, conf,
                         externalExecutorProvider, consumerSubscribedFuture, metadata.partitions, schema, interceptors);
             } else {

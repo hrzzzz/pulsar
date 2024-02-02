@@ -80,20 +80,23 @@ public class TransactionCoordinatorClientImpl implements TransactionCoordinatorC
     public CompletableFuture<Void> startAsync() {
         if (STATE_UPDATER.compareAndSet(this, State.NONE, State.STARTING)) {
             return pulsarClient.getLookup().getPartitionedTopicMetadata(SystemTopicNames.TRANSACTION_COORDINATOR_ASSIGN)
-                .thenCompose(partitionMeta -> {
+                .thenCompose(partitionMeta -> { // 获取到pulsar/system/transaction_coordinator_assign这个topic的元数据信息
                     List<CompletableFuture<Void>> connectFutureList = new ArrayList<>();
                     if (LOG.isDebugEnabled()) {
                         LOG.debug("Transaction meta store assign partition is {}.", partitionMeta.partitions);
                     }
                     if (partitionMeta.partitions > 0) {
+                        // 因为每个tc都会有一个分区，因此要创建对应分区数个handler
                         handlers = new TransactionMetaStoreHandler[partitionMeta.partitions];
                         for (int i = 0; i < partitionMeta.partitions; i++) {
                             CompletableFuture<Void> connectFuture = new CompletableFuture<>();
                             connectFutureList.add(connectFuture);
+                            // 分区编号就是tc的编号
                             TransactionMetaStoreHandler handler = new TransactionMetaStoreHandler(
                                     i, pulsarClient, getTCAssignTopicName(i), connectFuture);
                             handlers[i] = handler;
                             handlerMap.put(i, handler);
+                            // 启动handler，handler会和tc连接
                             handler.start();
                         }
                     } else {

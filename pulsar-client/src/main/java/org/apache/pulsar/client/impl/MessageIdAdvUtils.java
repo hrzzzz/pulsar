@@ -41,19 +41,24 @@ public class MessageIdAdvUtils {
     }
 
     static boolean acknowledge(MessageIdAdv msgId, boolean individual) {
+        // 不是batch消息直接返回
         if (!isBatch(msgId)) {
             return true;
         }
+        // 获取ackSet
         final BitSet ackSet = msgId.getAckSet();
         if (ackSet == null) {
             // The internal MessageId implementation should never reach here. If users have implemented their own
             // MessageId and getAckSet() is not override, return false to avoid acknowledge current entry.
             return false;
         }
+        // 获取该消息是batch消息中的第几条消息
         int batchIndex = msgId.getBatchIndex();
         if (individual) {
+            // 单独确认时，ackSet中对应位置设置为0：11011
             ackSet.clear(batchIndex);
         } else {
+            // 累计确认时，把ackSet中对应位置及之前的都设置为0：000111
             ackSet.clear(0, batchIndex + 1);
         }
         return ackSet.isEmpty();

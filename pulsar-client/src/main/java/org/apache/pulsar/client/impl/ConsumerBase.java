@@ -215,14 +215,20 @@ public abstract class ConsumerBase<T> extends HandlerState implements Consumer<T
     public abstract int minReceiverQueueSize();
 
     protected void expectMoreIncomingMessages() {
+        // 关闭自动扩展receiverQueueSize大小时，才需要下面的代码去扩展
         if (!conf.isAutoScaledReceiverQueueSizeEnabled()) {
             return;
         }
+        // 获取内存使用率
         double usage = getMemoryLimitController().map(MemoryLimitController::currentUsagePercent).orElse(0d);
+        // 如果内存使用率小于receiverQueenSize最大的内存使用率，并且需要扩展receiverQueenSize
         if (usage < MEMORY_THRESHOLD_FOR_RECEIVER_QUEUE_SIZE_EXPANSION
                  && scaleReceiverQueueHint.compareAndSet(true, false)) {
+            // 当前receiverQueueSize大小
             int oldSize = getCurrentReceiverQueueSize();
+            // 新receiverQueenSize大小是旧大小*2和max之间的最小值
             int newSize = Math.min(maxReceiverQueueSize, oldSize * 2);
+            // 设置新的receiverQueue大小
             setCurrentReceiverQueueSize(newSize);
         }
     }
@@ -230,6 +236,7 @@ public abstract class ConsumerBase<T> extends HandlerState implements Consumer<T
     // if listener is not null, we will track unAcked msg in callMessageListener
     protected void trackUnAckedMsgIfNoListener(MessageId messageId, int redeliveryCount) {
         if (listener == null) {
+            // 没有设置listener的情况下，将消息加到tracker中，否则由listener追踪消息
             unAckedMessageTracker.add(messageId, redeliveryCount);
         }
     }
@@ -834,6 +841,7 @@ public abstract class ConsumerBase<T> extends HandlerState implements Consumer<T
     }
 
     protected Message<T> beforeConsume(Message<T> message) {
+        // 有interceptor则调用一下interceptor，否则直接返回消息
         if (interceptors != null) {
             return interceptors.beforeConsume(this, message);
         } else {

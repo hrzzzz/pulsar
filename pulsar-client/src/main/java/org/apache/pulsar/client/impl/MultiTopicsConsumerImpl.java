@@ -949,6 +949,8 @@ public class MultiTopicsConsumerImpl<T> extends ConsumerBase<T> {
                 "Should have only 1 topic for partitioned consumer");
 
         // get topic name, then remove it from conf, so constructor will create a consumer with no topic.
+        // 先拿到topic名，然后把topic名从配置中移除，这样在下面创建MultiTopicsConsumerImpl的时候就会得到一个没有topic的consumer
+        // 为什么这样？？
         ConsumerConfigurationData<T> cloneConf = conf.clone();
         String topicName = cloneConf.getSingleTopic();
         cloneConf.getTopicNames().remove(topicName);
