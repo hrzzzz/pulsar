@@ -77,7 +77,7 @@ public class OpenTelemetryProducerInterceptor implements ProducerInterceptor {
 
     @Override
     public boolean eligible(Message<?> message) {
-        return tracer != null && propagator != null;
+        return true;
     }
 
     @Override
@@ -85,7 +85,7 @@ public class OpenTelemetryProducerInterceptor implements ProducerInterceptor {
         // Initialize tracer from producer on first call
         initializeIfNeeded(producer);
 
-        if (!eligible(message)) {
+        if (tracer == null || propagator == null) {
             return message;
         }
 
